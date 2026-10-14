@@ -142,7 +142,6 @@ void run_opposing_gpu_soln( std::vector< element_t > data, std::size_t switch_at
     CHECK_ERROR("Padding data array on device");
     // Warm the cache on the GPU for a more fair comparison
     warm_the_gpu<<< sort_blocks, threads_per_block>>>( d_data, switch_at, n );
-    cudaDeviceSynchronize();
 
     // Time the execution of the kernel that you implemented
     auto const kernel_start = std::chrono::high_resolution_clock::now();

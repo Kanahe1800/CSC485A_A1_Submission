@@ -40,16 +40,19 @@ void warm_the_gpu( element_t * data, std::size_t num_elements )
     }
 }
 
+
 /**
- * Outputs a histogram of size RADIX_DOMAIN that counts how many times a digit (of a certain place_value value) appears in d_data
- * Outputs a flattened 2D array block_digit_counts such that each "row" is the block number and each "column" is the digit. Used for 
+ * Outputs:
+ *   output_histogram: a histogram of size RADIX_DOMAIN that counts how many times a digit (of a certain place value) appears in d_data
+ *   block_digit_counts: a flattened 2D array such that each "row" is the block number and each "column" is the digit. Used for calculating the correct offsets for ranking
  */
 __global__
-void histogram( element_t * data, element_t * output_histogram, element_t * block_digit_counts, std::size_t num_data, int num_blocks, int place_value)
+void histogram( element_t * data, element_t * output_histogram, element_t * block_digit_counts, std::size_t num_elements, int num_blocks, int place_value)
 {
-    //init shared memory as buckets
+    // init shared memory as buckets
     __shared__ element_t smem_histogram [RADIX_DOMAIN]; 
 
+    // get both global and local thread ids
     int warp_id = threadIdx.y;
     int lane_id = threadIdx.x;
     int const local_th_id = (warp_id * blockDim.x) + lane_id;
@@ -62,32 +65,37 @@ void histogram( element_t * data, element_t * output_histogram, element_t * bloc
 
     __syncthreads();
 
-    if (global_th_id < num_data){
-        int place_data_val = (data[global_th_id] / place_value) % 10; 
-        atomicAdd(&smem_histogram[place_data_val], 1);
+    // increment bucket at digit of the current place value
+    if (global_th_id < num_elements){
+        int digit = (data[global_th_id] / place_value) % 10; 
+        atomicAdd(&smem_histogram[digit], 1);
     }
 
     __syncthreads();
 
+    // store how many times each digit appears in this block inside block_digit_counts
+    // increment the output histogram with what is in shared memory buckets
     if (local_th_id < RADIX_DOMAIN){
-        int digit = local_th_id;
-        block_digit_counts[digit * num_blocks + blockIdx.x] = smem_histogram[digit];
-        atomicAdd(&output_histogram[digit], smem_histogram[digit]);
+        block_digit_counts[local_th_id * num_blocks + blockIdx.x] = smem_histogram[local_th_id];
+        atomicAdd(&output_histogram[local_th_id], smem_histogram[local_th_id]);
     }
 
     return;
 }
 
 
+/**
+ * Outputs:
+ * output_exclusive_scan: an exclusive prefix sum of the histogram
+ */
 __global__
-void exclusive_scan( element_t * input_histogram, element_t * output_exclusive, std::size_t num_elements)
+void exclusive_scan( element_t * input_histogram, element_t * output_exclusive_scan, std::size_t num_elements)
 {
     __shared__ element_t smem [RADIX_DOMAIN]; 
 
     int warp_id = threadIdx.y;
     int lane_id = threadIdx.x;
     int const local_th_id = (warp_id * blockDim.x) + lane_id; // only use local th_id because we only need 1 block
-
 
     // init smem
     if (local_th_id < RADIX_DOMAIN){
@@ -102,6 +110,7 @@ void exclusive_scan( element_t * input_histogram, element_t * output_exclusive, 
 
         element_t new_value = 0;
 
+        // every thread in block is reading old values
         if (local_th_id < num_elements) {
             new_value = smem[local_th_id];
 
@@ -110,33 +119,38 @@ void exclusive_scan( element_t * input_histogram, element_t * output_exclusive, 
             }
         }
 
-        __syncthreads();   // everyone finishes reading old values
+        __syncthreads();   
 
+        // every thread in block is writing new values
         if (local_th_id < num_elements) {
             smem[local_th_id] = new_value;
         }
 
-        __syncthreads();   // everyone finishes this stride
+        __syncthreads(); 
     }
 
-    __syncthreads();
 
     //copy back
-    //shift right and append a 0
+    //shift right and append a 0 to make the prefix sum exclusive
     if (local_th_id < num_elements) {
         if (local_th_id == 0)
-            output_exclusive[0] = 0;
+            output_exclusive_scan[0] = 0;
         else
-            output_exclusive[local_th_id] = smem[local_th_id - 1];
+            output_exclusive_scan[local_th_id] = smem[local_th_id - 1];
     }
 
     return;
 }
 
 
+/**
+ * Outputs:
+ * output_rank: an array where each element stores its rank among elements with the same digit in its block (0 indexed)
+ */
 __global__
 void rank( element_t * data, element_t * output_rank, std::size_t num_elements, int place_value)
 {
+    //rank of an element's digit in a warp
     __shared__ int warp_count[MAX_WARPS][RADIX_DOMAIN];
 
     int warp_id = threadIdx.y;
@@ -144,63 +158,69 @@ void rank( element_t * data, element_t * output_rank, std::size_t num_elements, 
     int const local_th_id = (warp_id * blockDim.x) + lane_id;
     int const global_th_id = (blockIdx.x * (blockDim.x * blockDim.y) + ((warp_id * blockDim.x) + lane_id));
 
-    // initialize all warp/digit counts to 0
+    // init all warp/digit counts to 0
     if (local_th_id < MAX_WARPS * RADIX_DOMAIN) {
         warp_count[local_th_id / RADIX_DOMAIN][local_th_id % RADIX_DOMAIN] = 0;
     }
+
     __syncthreads();
 
     int digit = 0;
     int rank_in_warp = 0;
 
+    // calculate the rank of an element's digit in a warp
     if (global_th_id < num_elements) {
         digit = (data[global_th_id] / place_value) % 10;
 
-        unsigned same = __match_any_sync(__activemask(), digit); // find every lane in my warp with the same digit
-        unsigned before_me = (1u << lane_id) - 1; // make a mask of lanes before me
-        unsigned matching_before_me = same & before_me; // keep only matching lanes that are before me
+        unsigned lanes_same = __match_any_sync(__activemask(), digit); // mask of lanes in current warp with the same digit
+        unsigned lanes_before = (1u << lane_id) - 1; // mask of lanes before the current lane
+        unsigned lanes_same_before = lanes_same & lanes_before; // mask of lanes that are both before and the same digit as the current lane and warp
 
         // count them
-        rank_in_warp = __popc(matching_before_me);
-        int count_in_warp = __popc(same);
+        rank_in_warp = __popc(lanes_same_before);
+        int count_in_warp = __popc(lanes_same);
 
         if (rank_in_warp == 0) {
             warp_count[warp_id][digit] = count_in_warp;
         }
 
     }
+
     __syncthreads();
 
+    // calculate the rank of an element's digit in a block
     if (global_th_id < num_elements) {
-        int earlier_warp_count = 0;
+        int prev_warp_count = 0;
 
-        for (int w = 0; w < warp_id; w++) {
-            earlier_warp_count += warp_count[w][digit];
+        for (int warp = 0; warp < warp_id; warp++) {
+            prev_warp_count += warp_count[warp][digit];
         }
 
-        int rank_in_block = earlier_warp_count + rank_in_warp;
+        int rank_in_block = prev_warp_count + rank_in_warp;
 
         output_rank[global_th_id] = rank_in_block;
     }
 }
 
-
+/**
+ * Outputs:
+ * output: an array containing the final sorted version of our data
+ */
 __global__
 void scatter( element_t * data, element_t *output, element_t * exclusive_scan_data, element_t * rank, element_t * block_digit_counts,
-std::size_t num_data, std::size_t num_exclusive_scan_data, int num_blocks, int place_value)
+            std::size_t num_elements, std::size_t num_exclusive_scan_data, int num_blocks, int place_value)
 {
 
     int warp_id = threadIdx.y;
     int lane_id = threadIdx.x;
-    // int const local_th_id = (warp_id * blockDim.x) + lane_id; // only use local th_id because we only need 1 block
     int const global_th_id = (blockIdx.x * (blockDim.x * blockDim.y) + ((warp_id * blockDim.x) + lane_id));
 
-    if (global_th_id < num_data){
-        //read first
+    if (global_th_id < num_elements){
+        // read target data
         int target_data = data[global_th_id];
         int digit = (data[global_th_id] / place_value) % 10; 
 
-        //sum all of the times digit appears in all of the previous blocks to offset the local rank
+        //sum of the times digit appears in all of the previous blocks to offset the local rank
         int earlier_blocks_count = 0;
         for (int block = 0; block < blockIdx.x; block++) {
             earlier_blocks_count += block_digit_counts[digit * num_blocks + block];
@@ -208,7 +228,7 @@ std::size_t num_data, std::size_t num_exclusive_scan_data, int num_blocks, int p
 
         int target_index = exclusive_scan_data[digit] + rank[global_th_id] + earlier_blocks_count;
 
-        //update next 
+        //update output with target data
         output[target_index] = target_data;
 
     }
@@ -238,7 +258,6 @@ void run_radix_gpu_soln( std::vector< element_t > data, std::size_t n )
     element_t * d_output_rank;
     element_t * d_output;
     element_t * d_block_digit_counts;
-    element_t * d_block_prefix;
 
     cudaMalloc( (void**) & d_data, sizeof( element_t ) * n );
     cudaMalloc( (void**) & d_output_histogram, sizeof( element_t ) * RADIX_DOMAIN);
@@ -246,15 +265,11 @@ void run_radix_gpu_soln( std::vector< element_t > data, std::size_t n )
     cudaMalloc( (void**) & d_output_rank, sizeof( element_t ) * n );
     cudaMalloc( (void**) & d_output, sizeof( element_t ) * n );
     cudaMalloc( (void**) & d_block_digit_counts, sizeof(element_t) * num_blocks * RADIX_DOMAIN);
-    cudaMalloc( (void**) & d_block_prefix, sizeof(element_t) * num_blocks * RADIX_DOMAIN);
     CHECK_ERROR("Allocating input array on device");
 
-    // Copy the input from the host to the device/GPU
+    // Copy the input from the host to the device/GPU, while setting other arrays to 0
     cudaMemcpy( d_data, data.data(), sizeof( element_t ) * n, cudaMemcpyHostToDevice );
-    cudaMemset(d_output_histogram, 0, sizeof(element_t) * RADIX_DOMAIN); // set to 0
-    cudaMemset(d_output_exclusive_scan, 0, sizeof(element_t) * RADIX_DOMAIN); 
-    cudaMemset(d_output_rank, 0, sizeof(element_t) * n);
-    cudaMemset(d_output, 0, sizeof(element_t) * n);
+    cudaMemset(d_output_histogram, 0, sizeof(element_t) * RADIX_DOMAIN); 
     CHECK_ERROR("Copying input array to device");
 
     // Warm the cache on the GPU for a more fair comparison
@@ -280,9 +295,6 @@ void run_radix_gpu_soln( std::vector< element_t > data, std::size_t n )
         std::swap(d_data, d_output);
     }
 
-
-    cudaDeviceSynchronize();
-
     auto const kernel_end = std::chrono::high_resolution_clock::now();
     CHECK_ERROR("Executing kernel on device");
 
@@ -290,23 +302,22 @@ void run_radix_gpu_soln( std::vector< element_t > data, std::size_t n )
     // and echo out the timings and the results.
     cudaMemcpy( data.data(), d_data, sizeof( element_t ) * n, cudaMemcpyDeviceToHost );
     CHECK_ERROR("Transferring result back to host");
+
     cudaFree( d_data );
     cudaFree( d_output_histogram );
     cudaFree( d_output_exclusive_scan );
     cudaFree( d_output_rank );
     cudaFree( d_output );
     cudaFree( d_block_digit_counts );
-    cudaFree( d_block_prefix );
     CHECK_ERROR("Freeing device memory");
 
     std::cout << "GPU Radix Solution time: "
               << std::chrono::duration_cast<std::chrono::nanoseconds>(kernel_end - kernel_start).count()
               << " ns" << std::endl;
-    std::cout << "Radix result sorted ascending: "
-              << ( std::is_sorted( data.begin(), data.end() ) ? "yes" : "no" ) << std::endl;
-
 
     // for( auto const x : data ) std::cout << x << " "; std::cout << std::endl;
+    std::cout << "Radix result sorted ascending: "
+              << ( std::is_sorted( data.begin(), data.end() ) ? "yes" : "no" ) << std::endl;
 }
 
 } // namespace radix
